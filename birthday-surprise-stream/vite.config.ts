@@ -6,6 +6,10 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
+  base: '/Gift/',
+  plugins: [
+    react(),
+    tailwindcss(),
     plugins: [
       react(),
       tailwindcss(),
