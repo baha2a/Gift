@@ -1,0 +1,120 @@
+{
+  "entities": {
+    "Gift": {
+      "title": "Gift",
+      "description": "Lightweight metadata for a surprise video dedication (videos are streamed via server or external URL, never stored as binary blobs in Firestore).",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier for the gift",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the creator who owns this gift",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "title": {
+          "type": "string",
+          "description": "Cover headline shown before unveiling the video",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "recipientName": {
+          "type": "string",
+          "description": "Optional recipient name shown on the cover",
+          "maxLength": 80
+        },
+        "closingMessage": {
+          "type": "string",
+          "description": "Closing tribute shown after the video ends",
+          "minLength": 1,
+          "maxLength": 140
+        },
+        "senderName": {
+          "type": "string",
+          "description": "Optional sender signature shown in the closing tribute",
+          "maxLength": 80
+        },
+        "originalName": {
+          "type": "string",
+          "description": "Original filename of the video",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "mimeType": {
+          "type": "string",
+          "description": "MIME type of the video file",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "size": {
+          "type": "integer",
+          "description": "Total byte size of the video file"
+        },
+        "sourceType": {
+          "type": "string",
+          "description": "Where the video stream originates",
+          "enum": ["server", "url"]
+        },
+        "videoUrl": {
+          "type": "string",
+          "description": "Stream endpoint or external direct video URL",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "allowDownload": {
+          "type": "boolean",
+          "description": "Whether the recipient can download the original video in the finale"
+        },
+        "isPrimary": {
+          "type": "boolean",
+          "description": "Whether this gift is featured on the main root URL"
+        },
+        "status": {
+          "type": "string",
+          "description": "Publication state of the gift",
+          "enum": ["uploading", "ready"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server last update timestamp"
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "title",
+        "recipientName",
+        "closingMessage",
+        "senderName",
+        "originalName",
+        "mimeType",
+        "size",
+        "sourceType",
+        "videoUrl",
+        "allowDownload",
+        "isPrimary",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/gifts/{giftId}": {
+      "schema": { "$ref": "#/entities/Gift" },
+      "description": "Stores lightweight metadata and presentation settings for surprise gifts"
+    }
+  }
+}

@@ -53,6 +53,10 @@ export default function SurpriseStage({ gift }: SurpriseStageProps) {
   const [sanctuaryImageFailed, setSanctuaryImageFailed] = useState(false);
   const [finaleImageFailed, setFinaleImageFailed] = useState(false);
 
+  // Download state for large Range-chunked files
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState(0);
+
   // Video player state
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const playerWrapperRef = useRef<HTMLDivElement | null>(null);
@@ -67,8 +71,6 @@ export default function SurpriseStage({ gift }: SurpriseStageProps) {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showControls, setShowControls] = useState(true);
   const [videoError, setVideoError] = useState(false);
-  const [isDownloading, setIsDownloading] = useState(false);
-  const [downloadProgress, setDownloadProgress] = useState(0);
 
   // Never spoil "birthday" on the initial cover screen
   const displayCoverTitle =
@@ -145,7 +147,7 @@ export default function SurpriseStage({ gift }: SurpriseStageProps) {
 
   const startPlayback = useCallback(() => {
     const vid = videoRef.current;
-    if (!vid) return;
+    if (!vid || !gift.videoUrl) return;
     vid.currentTime = 0;
     vid.muted = false;
     setIsMuted(false);
@@ -161,7 +163,7 @@ export default function SurpriseStage({ gift }: SurpriseStageProps) {
           setShowControls(true);
         });
     }
-  }, [scheduleControlsHide]);
+  }, [scheduleControlsHide, gift.videoUrl]);
 
   const handleOpenSurprise = () => {
     fireGoldenCelebration('unveil');
@@ -170,13 +172,13 @@ export default function SurpriseStage({ gift }: SurpriseStageProps) {
   };
 
   useEffect(() => {
-    if (stage === 'playing') {
+    if (stage === 'playing' && gift.videoUrl) {
       const timer = window.setTimeout(() => {
         startPlayback();
       }, 220);
       return () => window.clearTimeout(timer);
     }
-  }, [stage, startPlayback]);
+  }, [stage, gift.videoUrl, startPlayback]);
 
   const togglePlayPause = () => {
     const vid = videoRef.current;
@@ -262,64 +264,78 @@ export default function SurpriseStage({ gift }: SurpriseStageProps) {
 
   const handleRetryVideo = () => {
     setVideoError(false);
+    setIsBuffering(true);
     const vid = videoRef.current;
     if (vid) {
       vid.load();
     }
     window.setTimeout(() => {
       startPlayback();
-    }, 150);
+    }, 180);
   };
 
   const handleDownloadFullVideo = async () => {
-    if (isDownloading) return;
-    setIsDownloading(true);
-    setDownloadProgress(0);
-    try {
-      const totalSize = gift.size;
-      if (totalSize <= 16 * 1024 * 1024) {
+    if (!gift.videoUrl || isDownloading) return;
+    const filename = gift.originalName || `special-surprise-${gift.id}.mp4`;
+
+    // For large server-hosted videos (>16MB), fetch 4MB Range slices to bypass the 32MB response cap
+    if (gift.sourceType === 'server' && gift.size > 16 * 1024 * 1024) {
+      setIsDownloading(true);
+      setDownloadProgress(0);
+      try {
+        const CHUNK = 4 * 1024 * 1024;
+        const parts: BlobPart[] = [];
+        let start = 0;
+        while (start < gift.size) {
+          const end = Math.min(start + CHUNK - 1, gift.size - 1);
+          const res = await fetch(gift.videoUrl, {
+            headers: { Range: `bytes=${start}-${end}` },
+          });
+          if (!res.ok && res.status !== 206) {
+            throw new Error(`HTTP ${res.status}`);
+          }
+          const buf = await res.arrayBuffer();
+          parts.push(buf);
+          start = end + 1;
+          setDownloadProgress(Math.min(100, Math.round((start / gift.size) * 100)));
+        }
+
+        const blob = new Blob(parts, { type: gift.mimeType || 'video/mp4' });
+        const blobUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
-        a.href = `/api/videos/${gift.id}?download=1`;
-        a.download = gift.originalName || `special-surprise-${gift.id}.mp4`;
+        a.href = blobUrl;
+        a.download = filename;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
-        setDownloadProgress(100);
-        return;
+        window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+      } catch {
+        // Fallback to direct download URL if Range assembly fails
+        const a = document.createElement('a');
+        a.href = `${gift.videoUrl}?download=1`;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      } finally {
+        setIsDownloading(false);
+        setDownloadProgress(0);
       }
-
-      const chunkSize = 4 * 1024 * 1024;
-      const parts: BlobPart[] = [];
-      let offset = 0;
-
-      while (offset < totalSize) {
-        const end = Math.min(offset + chunkSize - 1, totalSize - 1);
-        const res = await fetch(`/api/videos/${gift.id}`, {
-          headers: { Range: `bytes=${offset}-${end}` },
-        });
-        if (!res.ok) throw new Error('Download chunk failed');
-        const buf = await res.arrayBuffer();
-        parts.push(buf);
-        offset += buf.byteLength;
-        setDownloadProgress(Math.round((offset / totalSize) * 100));
-        if (buf.byteLength === 0) break;
-      }
-
-      const blob = new Blob(parts, { type: gift.mimeType || 'video/mp4' });
-      const blobUrl = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = blobUrl;
-      a.download = gift.originalName || `special-surprise-${gift.id}.mp4`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
-    } finally {
-      setIsDownloading(false);
+      return;
     }
+
+    const downloadHref =
+      gift.sourceType === 'server'
+        ? `${gift.videoUrl}${gift.videoUrl.includes('?') ? '&' : '?'}download=1`
+        : gift.videoUrl;
+    const a = document.createElement('a');
+    a.href = downloadHref;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
   };
 
-  const videoSrc = `/api/videos/${gift.id}`;
   const progressPercent = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
 
   return (
@@ -357,7 +373,7 @@ export default function SurpriseStage({ gift }: SurpriseStageProps) {
               />
             </div>
 
-            {/* Centerpiece Pure Surprise Invitation */}
+            {/* Centerpiece Pure Surprise Invitation (Zero Studio/Admin UI) */}
             <div className="relative z-10 max-w-2xl w-full text-center flex flex-col items-center">
               <p className="text-sm md:text-base text-[#E5B869] tracking-wide mb-6 leading-relaxed">
                 ياذات الثغر الجميل
@@ -418,7 +434,6 @@ export default function SurpriseStage({ gift }: SurpriseStageProps) {
                 <div className="w-full h-full bg-gradient-to-b from-[#161009] via-[#09080B] to-[#060608]" />
               )}
 
-              {/* Warm theatrical vignette framing the center stage */}
               <div
                 aria-hidden="true"
                 className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(229,184,105,0.14)_0%,rgba(10,8,9,0.58)_55%,rgba(5,5,7,0.92)_100%)]"
@@ -427,7 +442,10 @@ export default function SurpriseStage({ gift }: SurpriseStageProps) {
 
             {/* Delicate Floating Golden Embers */}
             {!prefersReducedMotion && (
-              <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-[1] overflow-hidden">
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute inset-0 z-[1] overflow-hidden"
+              >
                 {STAGE_EMBERS.map((ember, idx) => (
                   <motion.span
                     key={idx}
@@ -486,7 +504,6 @@ export default function SurpriseStage({ gift }: SurpriseStageProps) {
               transition={{ duration: 0.9, delay: 0.12, ease: [0.16, 1, 0.3, 1] }}
               className="relative z-10 w-full max-w-5xl flex flex-col items-center"
             >
-              {/* Expanding warm golden stage halo behind frame */}
               <div
                 aria-hidden="true"
                 className="pointer-events-none absolute -inset-8 rounded-[36px] bg-[radial-gradient(ellipse_at_center,rgba(229,184,105,0.22)_0%,transparent_72%)] blur-2xl"
@@ -494,7 +511,6 @@ export default function SurpriseStage({ gift }: SurpriseStageProps) {
 
               {/* Double-Bezel Gilded Frame */}
               <div className="relative w-full p-[3px] rounded-[22px] bg-gradient-to-b from-[#E5B869]/60 via-[#E5B869]/22 to-[#E5B869]/50 shadow-[0_30px_100px_rgba(0,0,0,0.88),0_0_80px_rgba(229,184,105,0.18)]">
-                {/* Architectural Corner Filigree Accents */}
                 <span
                   aria-hidden="true"
                   className="pointer-events-none absolute -top-2 -right-2 w-6 h-6 border-t-2 border-r-2 border-[#E5B869]/80 rounded-tr-xl"
@@ -521,7 +537,7 @@ export default function SurpriseStage({ gift }: SurpriseStageProps) {
                 >
                   <video
                     ref={videoRef}
-                    src={videoSrc}
+                    src={gift.videoUrl}
                     playsInline
                     preload="auto"
                     onClick={togglePlayPause}
@@ -568,7 +584,7 @@ export default function SurpriseStage({ gift }: SurpriseStageProps) {
                     </button>
                   </div>
 
-                  {/* Center Play / Buffering / Error State */}
+                  {/* Loading / Error / Play Center States */}
                   {videoError ? (
                     <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/85 p-6 text-center">
                       <p className="text-base text-[#F6F1E7] mb-4">
@@ -598,93 +614,93 @@ export default function SurpriseStage({ gift }: SurpriseStageProps) {
                   ) : null}
 
                   {/* Bottom Custom Cinema Control Bar */}
-                  <div
-                    dir="ltr"
-                    className={`absolute inset-x-0 bottom-0 p-3 sm:p-5 bg-gradient-to-t from-black/90 via-black/55 to-transparent transition-opacity duration-200 ${
-                      showControls || !isPlaying ? 'opacity-100' : 'opacity-0 pointer-events-none'
-                    }`}
-                  >
-                    {/* Scrubber */}
-                    <div className="relative flex items-center mb-3">
-                      <div className="w-full h-1.5 bg-white/20 rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-[#E5B869] rounded-full"
-                          style={{ width: `${progressPercent}%` }}
+                  {!videoError && (
+                    <div
+                      dir="ltr"
+                      className={`absolute inset-x-0 bottom-0 p-3 sm:p-5 bg-gradient-to-t from-black/90 via-black/55 to-transparent transition-opacity duration-200 ${
+                        showControls || !isPlaying ? 'opacity-100' : 'opacity-0 pointer-events-none'
+                      }`}
+                    >
+                      <div className="relative flex items-center mb-3">
+                        <div className="w-full h-1.5 bg-white/20 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-[#E5B869] rounded-full"
+                            style={{ width: `${progressPercent}%` }}
+                          />
+                        </div>
+                        <input
+                          type="range"
+                          min={0}
+                          max={duration || 0}
+                          step={0.1}
+                          value={currentTime}
+                          onChange={(e) => handleSeek(Number(e.target.value))}
+                          aria-label="التحكم في موضع الفيديو"
+                          className="cinema-range absolute inset-0 w-full h-4 opacity-0 hover:opacity-100 focus:opacity-100"
                         />
                       </div>
-                      <input
-                        type="range"
-                        min={0}
-                        max={duration || 0}
-                        step={0.1}
-                        value={currentTime}
-                        onChange={(e) => handleSeek(Number(e.target.value))}
-                        aria-label="التحكم في موضع الفيديو"
-                        className="cinema-range absolute inset-0 w-full h-4 opacity-0 hover:opacity-100 focus:opacity-100"
-                      />
-                    </div>
 
-                    <div className="flex items-center justify-between gap-4">
-                      <div className="flex items-center gap-3 sm:gap-4">
-                        <button
-                          type="button"
-                          onClick={togglePlayPause}
-                          aria-label={isPlaying ? 'إيقاف مؤقت' : 'تشغيل'}
-                          className="w-10 h-10 rounded-lg flex items-center justify-center text-[#F6F1E7] hover:bg-white/10 transition-colors cursor-pointer"
-                        >
-                          {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5" />}
-                        </button>
+                      <div className="flex items-center justify-between gap-4">
+                        <div className="flex items-center gap-3 sm:gap-4">
+                          <button
+                            type="button"
+                            onClick={togglePlayPause}
+                            aria-label={isPlaying ? 'إيقاف مؤقت' : 'تشغيل'}
+                            className="w-10 h-10 rounded-lg flex items-center justify-center text-[#F6F1E7] hover:bg-white/10 transition-colors cursor-pointer"
+                          >
+                            {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5" />}
+                          </button>
+
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={toggleMute}
+                              aria-label={isMuted ? 'إلغاء كتم الصوت' : 'كتم الصوت'}
+                              className="w-10 h-10 rounded-lg flex items-center justify-center text-[#F6F1E7] hover:bg-white/10 transition-colors cursor-pointer"
+                            >
+                              {isMuted || volume === 0 ? (
+                                <VolumeX className="w-5 h-5 text-[#A69D8E]" />
+                              ) : (
+                                <Volume2 className="w-5 h-5" />
+                              )}
+                            </button>
+                            <input
+                              type="range"
+                              min={0}
+                              max={1}
+                              step={0.05}
+                              value={isMuted ? 0 : volume}
+                              onChange={(e) => handleVolumeChange(Number(e.target.value))}
+                              aria-label="مستوى الصوت"
+                              className="cinema-range hidden sm:block w-20 h-1 bg-white/25 rounded-full accent-[#E5B869]"
+                            />
+                          </div>
+
+                          <span className="text-xs sm:text-sm text-[#D8CEBE] tabular-nums select-none">
+                            {formatTime(currentTime)} / {formatTime(duration)}
+                          </span>
+                        </div>
 
                         <div className="flex items-center gap-2">
                           <button
                             type="button"
-                            onClick={toggleMute}
-                            aria-label={isMuted ? 'إلغاء كتم الصوت' : 'كتم الصوت'}
+                            onClick={toggleFullscreen}
+                            aria-label={isFullscreen ? 'تصغير الشاشة' : 'ملء الشاشة'}
                             className="w-10 h-10 rounded-lg flex items-center justify-center text-[#F6F1E7] hover:bg-white/10 transition-colors cursor-pointer"
                           >
-                            {isMuted || volume === 0 ? (
-                              <VolumeX className="w-5 h-5 text-[#A69D8E]" />
+                            {isFullscreen ? (
+                              <Minimize2 className="w-5 h-5" />
                             ) : (
-                              <Volume2 className="w-5 h-5" />
+                              <Maximize2 className="w-5 h-5" />
                             )}
                           </button>
-                          <input
-                            type="range"
-                            min={0}
-                            max={1}
-                            step={0.05}
-                            value={isMuted ? 0 : volume}
-                            onChange={(e) => handleVolumeChange(Number(e.target.value))}
-                            aria-label="مستوى الصوت"
-                            className="cinema-range hidden sm:block w-20 h-1 bg-white/25 rounded-full accent-[#E5B869]"
-                          />
                         </div>
-
-                        <span className="text-xs sm:text-sm text-[#D8CEBE] tabular-nums select-none">
-                          {formatTime(currentTime)} / {formatTime(duration)}
-                        </span>
-                      </div>
-
-                      <div className="flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={toggleFullscreen}
-                          aria-label={isFullscreen ? 'تصغير الشاشة' : 'ملء الشاشة'}
-                          className="w-10 h-10 rounded-lg flex items-center justify-center text-[#F6F1E7] hover:bg-white/10 transition-colors cursor-pointer"
-                        >
-                          {isFullscreen ? (
-                            <Minimize2 className="w-5 h-5" />
-                          ) : (
-                            <Maximize2 className="w-5 h-5" />
-                          )}
-                        </button>
                       </div>
                     </div>
-                  </div>
+                  )}
                 </div>
               </div>
 
-              {/* Soft warm floor reflection beneath the floating frame */}
               <div
                 aria-hidden="true"
                 className="w-4/5 h-6 mt-3 rounded-full bg-[radial-gradient(ellipse_at_center,rgba(229,184,105,0.22)_0%,transparent_70%)] blur-md"
@@ -756,17 +772,17 @@ export default function SurpriseStage({ gift }: SurpriseStageProps) {
                   <span>إعادة المشاهدة</span>
                 </button>
 
-                {gift.allowDownload && (
+                {gift.allowDownload && gift.videoUrl && (
                   <button
                     type="button"
                     disabled={isDownloading}
                     onClick={handleDownloadFullVideo}
-                    className="inline-flex items-center justify-center gap-2.5 px-7 py-3.5 rounded-full border border-[#E5B869]/35 bg-[#121115]/80 text-[#F6F1E7] font-medium text-sm md:text-base hover:bg-[#1B191F] hover:border-[#E5B869]/60 disabled:opacity-70 transition-all duration-200 whitespace-nowrap shrink-0 cursor-pointer"
+                    className="inline-flex items-center justify-center gap-2.5 px-7 py-3.5 rounded-full border border-[#E5B869]/35 bg-[#121115]/80 text-[#F6F1E7] font-medium text-sm md:text-base hover:bg-[#1B191F] hover:border-[#E5B869]/60 disabled:opacity-60 transition-all duration-200 whitespace-nowrap shrink-0 cursor-pointer"
                   >
                     <Download className="w-4 h-4 text-[#E5B869]" />
                     <span>
                       {isDownloading
-                        ? `جاري الحفظ (${downloadProgress}%)`
+                        ? `جاري التحميل (${downloadProgress}%)`
                         : 'حفظ الفيديو بالجودة الكاملة'}
                     </span>
                   </button>

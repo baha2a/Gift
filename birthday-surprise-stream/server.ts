@@ -2,34 +2,38 @@ import crypto from 'crypto';
 import dotenv from 'dotenv';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import fs from 'fs';
-import multer from 'multer';
 import path from 'path';
 
 dotenv.config();
 
-interface GiftRecord {
+interface ServerGiftRecord {
   id: string;
+  ownerId: string;
   title: string;
   recipientName: string;
   closingMessage: string;
   senderName: string;
-  filename: string;
+  filename?: string;
   originalName: string;
   mimeType: string;
   size: number;
+  sourceType: 'server' | 'url';
+  videoUrl: string;
   allowDownload: boolean;
   isPrimary: boolean;
+  status: 'uploading' | 'ready';
   createdAt: string;
+  updatedAt: string;
 }
 
 interface UploadSession {
   uploadId: string;
-  tempFilename: string;
   finalExt: string;
   originalName: string;
   mimeType: string;
   expectedSize: number;
   bytesReceived: number;
+  ownerId: string;
   title: string;
   recipientName: string;
   closingMessage: string;
@@ -40,7 +44,8 @@ interface UploadSession {
 }
 
 const PORT = Number(process.env.PORT) || 3000;
-const CHUNK_SIZE_BYTES = 4 * 1024 * 1024; // 4 MB chunks — safely under Cloud Run / nginx 32 MB cap
+const CHUNK_SIZE_BYTES = 4 * 1024 * 1024;
+const MAX_STREAM_CHUNK = 4 * 1024 * 1024;
 const STORAGE_ROOT = path.resolve(process.cwd(), 'storage');
 const VIDEOS_DIR = path.join(STORAGE_ROOT, 'videos');
 const TMP_DIR = path.join(STORAGE_ROOT, 'tmp');
@@ -52,27 +57,15 @@ if (!fs.existsSync(GIFTS_DB_PATH)) {
   fs.writeFileSync(GIFTS_DB_PATH, JSON.stringify([], null, 2), 'utf-8');
 }
 
-// Clean stale incomplete temp uploads older than 24 hours on startup
-try {
-  const now = Date.now();
-  for (const entry of fs.readdirSync(TMP_DIR)) {
-    const fullPath = path.join(TMP_DIR, entry);
-    const stat = fs.statSync(fullPath);
-    if (now - stat.mtimeMs > 24 * 60 * 60 * 1000) {
-      fs.unlinkSync(fullPath);
-    }
-  }
-} catch {
-  // Ignore cleanup errors
-}
-
-function readGifts(): GiftRecord[] {
+function readGifts(): ServerGiftRecord[] {
   try {
     const raw = fs.readFileSync(GIFTS_DB_PATH, 'utf-8');
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((item: GiftRecord) => {
-      if (!item || typeof item.filename !== 'string') return false;
+    return parsed.filter((item: ServerGiftRecord) => {
+      if (!item) return false;
+      if (item.sourceType === 'url') return Boolean(item.videoUrl);
+      if (typeof item.filename !== 'string') return false;
       return fs.existsSync(path.join(VIDEOS_DIR, path.basename(item.filename)));
     });
   } catch {
@@ -80,7 +73,7 @@ function readGifts(): GiftRecord[] {
   }
 }
 
-function writeGifts(gifts: GiftRecord[]): void {
+function writeGifts(gifts: ServerGiftRecord[]): void {
   const tempPath = `${GIFTS_DB_PATH}.tmp`;
   fs.writeFileSync(tempPath, JSON.stringify(gifts, null, 2), 'utf-8');
   fs.renameSync(tempPath, GIFTS_DB_PATH);
@@ -104,8 +97,8 @@ function sanitizeText(value: unknown, fallback: string, maxLen = 120): string {
   return trimmed.length > 0 ? trimmed.slice(0, maxLen) : fallback;
 }
 
-function isValidUploadId(id: string): boolean {
-  return /^[a-f0-9]{16}$/.test(id);
+function isValidId(id: string): boolean {
+  return /^[a-zA-Z0-9_-]{1,64}$/.test(id);
 }
 
 function getSessionMetaPath(uploadId: string): string {
@@ -117,7 +110,7 @@ function getSessionPartPath(uploadId: string): string {
 }
 
 function readSession(uploadId: string): UploadSession | null {
-  if (!isValidUploadId(uploadId)) return null;
+  if (!/^[a-f0-9]{16}$/.test(uploadId)) return null;
   const metaPath = getSessionMetaPath(uploadId);
   if (!fs.existsSync(metaPath)) return null;
   try {
@@ -128,53 +121,24 @@ function readSession(uploadId: string): UploadSession | null {
 }
 
 function writeSession(session: UploadSession): void {
-  const metaPath = getSessionMetaPath(session.uploadId);
-  fs.writeFileSync(metaPath, JSON.stringify(session, null, 2), 'utf-8');
+  fs.writeFileSync(getSessionMetaPath(session.uploadId), JSON.stringify(session, null, 2), 'utf-8');
 }
-
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, VIDEOS_DIR);
-  },
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const safeExt = ALLOWED_EXTENSIONS.has(ext) ? ext : '.mp4';
-    const uniqueName = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${safeExt}`;
-    cb(null, uniqueName);
-  },
-});
-
-const upload = multer({
-  storage,
-  limits: {
-    fileSize: 2 * 1024 * 1024 * 1024,
-  },
-  fileFilter: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const isVideoMime = file.mimetype.startsWith('video/');
-    if (isVideoMime || ALLOWED_EXTENSIONS.has(ext)) {
-      cb(null, true);
-    } else {
-      cb(new Error('يرجى اختيار ملف فيديو صالح (MP4 أو MOV أو WebM).'));
-    }
-  },
-});
 
 async function startServer(): Promise<void> {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
-  // List all permanently stored gifts
+  // List all server-stored gifts
   app.get('/api/gifts', (_req: Request, res: Response) => {
     const gifts = readGifts();
     const sorted = [...gifts].sort(
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
     );
-    const primaryGift = sorted.find((g) => g.isPrimary) ?? sorted[0] ?? null;
+    const primaryGift = sorted.find((g) => g.isPrimary && g.status === 'ready') ?? sorted[0] ?? null;
     res.json({ gifts: sorted, primaryGift });
   });
 
-  // Fetch the active primary gift or a specific gift by ID
+  // Fetch active primary gift or specific gift by ID
   app.get('/api/gifts/active', (req: Request, res: Response) => {
     const gifts = readGifts();
     const requestedId = typeof req.query.id === 'string' ? req.query.id.trim() : '';
@@ -182,7 +146,7 @@ async function startServer(): Promise<void> {
     if (requestedId) {
       const found = gifts.find((g) => g.id === requestedId);
       if (!found) {
-        res.status(404).json({ error: 'لم يتم العثور على هذا الإهداء.' });
+        res.status(404).json({ error: 'لم يتم العثور على هذا العرض.' });
         return;
       }
       res.json({ gift: found });
@@ -192,34 +156,84 @@ async function startServer(): Promise<void> {
     const sorted = [...gifts].sort(
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
     );
-    const primary = sorted.find((g) => g.isPrimary) ?? sorted[0] ?? null;
+    const primary = sorted.find((g) => g.isPrimary && g.status === 'ready') ?? sorted[0] ?? null;
     res.json({ gift: primary });
   });
 
-  // Chunked Upload Step 1: Initialize upload session (bypasses 32MB proxy request cap)
+  // Save an external permanent video URL (e.g., Google Drive / Dropbox / direct MP4)
+  app.post('/api/gifts/url', (req: Request, res: Response) => {
+    const rawUrl = typeof req.body?.videoUrl === 'string' ? req.body.videoUrl.trim() : '';
+    if (!rawUrl || !/^https?:\/\/.+/i.test(rawUrl)) {
+      res.status(400).json({ error: 'يرجى إدخال رابط فيديو صحيح يبدأ بـ http أو https.' });
+      return;
+    }
+
+    let finalUrl = rawUrl;
+    let originalName = 'surprise-video.mp4';
+
+    // Convert Google Drive sharing links to our Range-capable proxy endpoint
+    const driveMatch =
+      rawUrl.match(/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/) ||
+      rawUrl.match(/drive\.google\.com\/open\?id=([a-zA-Z0-9_-]+)/);
+    if (driveMatch && driveMatch[1]) {
+      finalUrl = `/api/drive-stream/${driveMatch[1]}`;
+      originalName = 'google-drive-video.mp4';
+    } else if (rawUrl.includes('dropbox.com')) {
+      finalUrl = rawUrl.replace(/([?&])dl=0\b/, '$1raw=1');
+      if (!finalUrl.includes('raw=1')) {
+        finalUrl += (finalUrl.includes('?') ? '&' : '?') + 'raw=1';
+      }
+    }
+
+    const gifts = readGifts();
+    const setPrimary = req.body?.setPrimary === true || gifts.length === 0;
+    const updatedGifts = setPrimary
+      ? gifts.map((g) => ({ ...g, isPrimary: false }))
+      : gifts;
+
+    const id = crypto.randomBytes(6).toString('hex');
+    const now = new Date().toISOString();
+    const newGift: ServerGiftRecord = {
+      id,
+      ownerId: sanitizeText(req.body?.ownerId, 'owner', 128),
+      title: sanitizeText(req.body?.title, 'هذه المفاجأة لك', 100),
+      recipientName: sanitizeText(req.body?.recipientName, '', 80),
+      closingMessage: sanitizeText(req.body?.closingMessage, 'كل عام وأنت بألف خير', 140),
+      senderName: sanitizeText(req.body?.senderName, '', 80),
+      originalName,
+      mimeType: 'video/mp4',
+      size: 0,
+      sourceType: 'url',
+      videoUrl: finalUrl,
+      allowDownload: req.body?.allowDownload !== false,
+      isPrimary: setPrimary,
+      status: 'ready',
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    updatedGifts.push(newGift);
+    writeGifts(updatedGifts);
+    res.status(201).json({ gift: newGift });
+  });
+
+  // Chunked server upload Step 1: Init
   app.post('/api/uploads/init', (req: Request, res: Response) => {
     const originalName =
       typeof req.body?.originalName === 'string' && req.body.originalName.trim()
         ? path.basename(req.body.originalName.trim())
-        : 'birthday-video.mp4';
+        : 'surprise-video.mp4';
     const mimeType =
       typeof req.body?.mimeType === 'string' ? req.body.mimeType.trim() : 'video/mp4';
     const expectedSize = Number(req.body?.size);
 
     const ext = path.extname(originalName).toLowerCase();
-    const isVideoMime = mimeType.startsWith('video/');
-    if (!isVideoMime && !ALLOWED_EXTENSIONS.has(ext)) {
+    if (!mimeType.startsWith('video/') && !ALLOWED_EXTENSIONS.has(ext)) {
       res.status(400).json({ error: 'يرجى اختيار ملف فيديو صالح (MP4 أو MOV أو WebM).' });
       return;
     }
-
-    if (!Number.isFinite(expectedSize) || expectedSize <= 0) {
-      res.status(400).json({ error: 'حجم ملف الفيديو غير صالح.' });
-      return;
-    }
-
-    if (expectedSize > 2 * 1024 * 1024 * 1024) {
-      res.status(400).json({ error: 'الحد الأقصى لحجم الفيديو هو 2 جيجابايت.' });
+    if (!Number.isFinite(expectedSize) || expectedSize <= 0 || expectedSize > 2 * 1024 * 1024 * 1024) {
+      res.status(400).json({ error: 'حجم الفيديو غير صالح (الحد الأقصى 2 جيجابايت).' });
       return;
     }
 
@@ -227,35 +241,30 @@ async function startServer(): Promise<void> {
     const safeExt = ALLOWED_EXTENSIONS.has(ext) ? ext : '.mp4';
     const gifts = readGifts();
     const setPrimary = req.body?.setPrimary === true || gifts.length === 0;
-    const allowDownload = req.body?.allowDownload !== false;
 
     const session: UploadSession = {
       uploadId,
-      tempFilename: `${uploadId}.part`,
       finalExt: safeExt,
       originalName,
       mimeType: inferMimeType(originalName, mimeType),
       expectedSize,
       bytesReceived: 0,
+      ownerId: sanitizeText(req.body?.ownerId, 'owner', 128),
       title: sanitizeText(req.body?.title, 'هذه المفاجأة لك', 100),
       recipientName: sanitizeText(req.body?.recipientName, '', 80),
       closingMessage: sanitizeText(req.body?.closingMessage, 'كل عام وأنت بألف خير', 140),
       senderName: sanitizeText(req.body?.senderName, '', 80),
-      allowDownload,
+      allowDownload: req.body?.allowDownload !== false,
       setPrimary,
       createdAt: new Date().toISOString(),
     };
 
     fs.writeFileSync(getSessionPartPath(uploadId), Buffer.alloc(0));
     writeSession(session);
-
-    res.status(201).json({
-      uploadId,
-      chunkSize: CHUNK_SIZE_BYTES,
-    });
+    res.status(201).json({ uploadId, chunkSize: CHUNK_SIZE_BYTES });
   });
 
-  // Chunked Upload Step 2: Receive a <= 4MB binary chunk at offset
+  // Chunked server upload Step 2: Receive 4MB chunk
   app.post(
     '/api/uploads/:uploadId/chunk',
     express.raw({ type: 'application/octet-stream', limit: '8mb' }),
@@ -263,7 +272,7 @@ async function startServer(): Promise<void> {
       const uploadId = req.params.uploadId;
       const session = readSession(uploadId);
       if (!session) {
-        res.status(404).json({ error: 'جلسة الرفع غير موجودة أو انتهت.' });
+        res.status(404).json({ error: 'جلسة الرفع غير موجودة.' });
         return;
       }
 
@@ -292,12 +301,11 @@ async function startServer(): Promise<void> {
         session.bytesReceived = endOffset;
         writeSession(session);
       }
-
       res.json({ bytesReceived: session.bytesReceived });
     }
   );
 
-  // Chunked Upload Step 3: Finalize and permanently save the video
+  // Chunked server upload Step 3: Complete
   app.post('/api/uploads/:uploadId/complete', (req: Request, res: Response) => {
     const uploadId = req.params.uploadId;
     const session = readSession(uploadId);
@@ -308,26 +316,21 @@ async function startServer(): Promise<void> {
 
     const partPath = getSessionPartPath(uploadId);
     if (!fs.existsSync(partPath)) {
-      res.status(404).json({ error: 'ملف الفيديو المؤقت غير موجود.' });
+      res.status(404).json({ error: 'الملف المؤقت غير موجود.' });
       return;
     }
 
     const stat = fs.statSync(partPath);
     if (stat.size < session.expectedSize) {
-      res.status(400).json({
-        error: 'لم يكتمل رفع جميع أجزاء الفيديو بعد.',
-      });
+      res.status(400).json({ error: 'لم يكتمل رفع جميع أجزاء الفيديو بعد.' });
       return;
     }
 
     const finalFilename = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${session.finalExt}`;
-    const finalPath = path.join(VIDEOS_DIR, finalFilename);
-    fs.renameSync(partPath, finalPath);
+    fs.renameSync(partPath, path.join(VIDEOS_DIR, finalFilename));
 
     const metaPath = getSessionMetaPath(uploadId);
-    if (fs.existsSync(metaPath)) {
-      fs.unlinkSync(metaPath);
-    }
+    if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
 
     const gifts = readGifts();
     const shouldBePrimary = session.setPrimary || gifts.length === 0;
@@ -335,9 +338,11 @@ async function startServer(): Promise<void> {
       ? gifts.map((g) => ({ ...g, isPrimary: false }))
       : gifts;
 
-    const id = crypto.randomBytes(5).toString('hex');
-    const newGift: GiftRecord = {
+    const id = crypto.randomBytes(6).toString('hex');
+    const now = new Date().toISOString();
+    const newGift: ServerGiftRecord = {
       id,
+      ownerId: session.ownerId,
       title: session.title,
       recipientName: session.recipientName,
       closingMessage: session.closingMessage,
@@ -346,95 +351,45 @@ async function startServer(): Promise<void> {
       originalName: session.originalName,
       mimeType: inferMimeType(finalFilename, session.mimeType),
       size: stat.size,
+      sourceType: 'server',
+      videoUrl: `/api/videos/${id}`,
       allowDownload: session.allowDownload,
       isPrimary: shouldBePrimary,
-      createdAt: new Date().toISOString(),
+      status: 'ready',
+      createdAt: now,
+      updatedAt: now,
     };
 
     updatedGifts.push(newGift);
     writeGifts(updatedGifts);
-
     res.status(201).json({ gift: newGift });
   });
 
-  // Cancel / cleanup an in-progress upload session
+  // Cancel upload session
   app.delete('/api/uploads/:uploadId', (req: Request, res: Response) => {
     const uploadId = req.params.uploadId;
-    if (!isValidUploadId(uploadId)) {
-      res.status(400).json({ error: 'معرف الجلسة غير صالح.' });
-      return;
+    if (/^[a-f0-9]{16}$/.test(uploadId)) {
+      const partPath = getSessionPartPath(uploadId);
+      const metaPath = getSessionMetaPath(uploadId);
+      if (fs.existsSync(partPath)) fs.unlinkSync(partPath);
+      if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
     }
-    const partPath = getSessionPartPath(uploadId);
-    const metaPath = getSessionMetaPath(uploadId);
-    if (fs.existsSync(partPath)) fs.unlinkSync(partPath);
-    if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
     res.json({ ok: true });
   });
 
-  // Legacy single-request upload fallback for small files (< 30MB)
-  app.post('/api/gifts', (req: Request, res: Response) => {
-    upload.single('video')(req, res, (err: unknown) => {
-      if (err) {
-        const message =
-          err instanceof Error ? err.message : 'تعذر رفع الفيديو، يرجى المحاولة مرة أخرى.';
-        res.status(400).json({ error: message });
-        return;
-      }
-
-      const file = req.file;
-      if (!file) {
-        res.status(400).json({ error: 'لم يتم إرفاق أي ملف فيديو.' });
-        return;
-      }
-
-      const gifts = readGifts();
-      const setPrimary =
-        req.body?.setPrimary === 'true' || req.body?.setPrimary === true || gifts.length === 0;
-
-      const updatedGifts = setPrimary
-        ? gifts.map((g) => ({ ...g, isPrimary: false }))
-        : gifts;
-
-      const id = crypto.randomBytes(5).toString('hex');
-      const allowDownload =
-        req.body?.allowDownload === undefined
-          ? true
-          : req.body.allowDownload === 'true' || req.body.allowDownload === true;
-
-      const newGift: GiftRecord = {
-        id,
-        title: sanitizeText(req.body?.title, 'هذه المفاجأة لك', 100),
-        recipientName: sanitizeText(req.body?.recipientName, '', 80),
-        closingMessage: sanitizeText(req.body?.closingMessage, 'كل عام وأنت بألف خير', 140),
-        senderName: sanitizeText(req.body?.senderName, '', 80),
-        filename: file.filename,
-        originalName: file.originalname || `birthday-gift-${id}.mp4`,
-        mimeType: inferMimeType(file.filename, file.mimetype),
-        size: file.size,
-        allowDownload,
-        isPrimary: setPrimary,
-        createdAt: new Date().toISOString(),
-      };
-
-      updatedGifts.push(newGift);
-      writeGifts(updatedGifts);
-
-      res.status(201).json({ gift: newGift });
-    });
-  });
-
-  // Update gift presentation details or promote to primary
+  // Update gift presentation metadata
   app.patch('/api/gifts/:id', (req: Request, res: Response) => {
     const id = req.params.id;
     const gifts = readGifts();
     const index = gifts.findIndex((g) => g.id === id);
     if (index === -1) {
-      res.status(404).json({ error: 'الإهداء غير موجود.' });
+      res.status(404).json({ error: 'العرض غير موجود.' });
       return;
     }
 
     const existing = gifts[index];
     const makePrimary = req.body?.isPrimary === true;
+    const now = new Date().toISOString();
 
     const updatedList = gifts.map((g, idx) => {
       if (idx === index) {
@@ -461,6 +416,7 @@ async function startServer(): Promise<void> {
               ? req.body.allowDownload
               : existing.allowDownload,
           isPrimary: makePrimary ? true : existing.isPrimary,
+          updatedAt: now,
         };
       }
       return makePrimary ? { ...g, isPrimary: false } : g;
@@ -470,13 +426,13 @@ async function startServer(): Promise<void> {
     res.json({ gift: updatedList[index] });
   });
 
-  // Permanently delete a gift and its video file
+  // Delete gift
   app.delete('/api/gifts/:id', (req: Request, res: Response) => {
     const id = req.params.id;
     const gifts = readGifts();
     const target = gifts.find((g) => g.id === id);
     if (!target) {
-      res.status(404).json({ error: 'الإهداء غير موجود.' });
+      res.status(404).json({ error: 'العرض غير موجود.' });
       return;
     }
 
@@ -489,25 +445,25 @@ async function startServer(): Promise<void> {
     }
     writeGifts(remaining);
 
-    const filePath = path.join(VIDEOS_DIR, path.basename(target.filename));
-    if (fs.existsSync(filePath)) {
-      fs.unlink(filePath, () => {});
+    if (target.filename) {
+      const filePath = path.join(VIDEOS_DIR, path.basename(target.filename));
+      if (fs.existsSync(filePath)) fs.unlink(filePath, () => {});
     }
 
     res.json({ ok: true });
   });
 
-  // High-definition lossless video streaming with HTTP 206 Range support
+  // Bounded 4MB Range streaming for server-stored videos
   app.get('/api/videos/:id', (req: Request, res: Response) => {
     const id = req.params.id;
-    if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+    if (!isValidId(id)) {
       res.status(400).json({ error: 'معرف غير صالح.' });
       return;
     }
 
     const gifts = readGifts();
     const gift = gifts.find((g) => g.id === id);
-    if (!gift) {
+    if (!gift || !gift.filename) {
       res.status(404).json({ error: 'الفيديو غير موجود.' });
       return;
     }
@@ -521,11 +477,8 @@ async function startServer(): Promise<void> {
     const stat = fs.statSync(videoPath);
     const fileSize = stat.size;
     const contentType = inferMimeType(videoPath, gift.mimeType);
-    const isDownload = req.query.download === '1';
-    const MAX_STREAM_CHUNK = 4 * 1024 * 1024; // 4 MB per 206 response (under Cloud Run 32 MB cap)
-
-    if (isDownload) {
-      const encodedName = encodeURIComponent(gift.originalName || `birthday-gift-${gift.id}.mp4`);
+    if (req.query.download === '1') {
+      const encodedName = encodeURIComponent(gift.originalName || `surprise-${gift.id}.mp4`);
       res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodedName}`);
     }
 
@@ -535,13 +488,7 @@ async function startServer(): Promise<void> {
       const start = parseInt(parts[0], 10);
       const rawEnd = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
 
-      if (
-        Number.isNaN(start) ||
-        Number.isNaN(rawEnd) ||
-        start < 0 ||
-        start >= fileSize ||
-        rawEnd < start
-      ) {
+      if (Number.isNaN(start) || Number.isNaN(rawEnd) || start < 0 || start >= fileSize || rawEnd < start) {
         res.status(416).setHeader('Content-Range', `bytes */${fileSize}`).end();
         return;
       }
@@ -589,7 +536,58 @@ async function startServer(): Promise<void> {
     stream.pipe(res);
   });
 
-  // Global API error guard
+  // Google Drive public video stream proxy (supports Range requests for instant HD seeking)
+  app.get('/api/drive-stream/:fileId', async (req: Request, res: Response) => {
+    const fileId = req.params.fileId;
+    if (!/^[a-zA-Z0-9_-]{10,80}$/.test(fileId)) {
+      res.status(400).json({ error: 'معرف Google Drive غير صالح.' });
+      return;
+    }
+
+    try {
+      const targetUrl = `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
+      const headers: Record<string, string> = {};
+      if (req.headers.range) {
+        headers.Range = req.headers.range;
+      }
+
+      const upstream = await fetch(targetUrl, { headers, redirect: 'follow' });
+      const contentType = upstream.headers.get('content-type') || 'video/mp4';
+      if (!upstream.ok && upstream.status !== 206) {
+        res.status(upstream.status).json({ error: 'تعذر جلب الفيديو من Google Drive. تأكد من مشاركته للعامة.' });
+        return;
+      }
+
+      if (contentType.includes('text/html')) {
+        res.status(400).json({ error: 'تأكد من جعل رابط Google Drive عاماً (Anyone with the link).' });
+        return;
+      }
+
+      res.status(upstream.status);
+      for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
+        const val = upstream.headers.get(h);
+        if (val) res.setHeader(h, val);
+      }
+
+      if (!upstream.body) {
+        res.end();
+        return;
+      }
+
+      const reader = upstream.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(Buffer.from(value));
+      }
+      res.end();
+    } catch {
+      if (!res.headersSent) {
+        res.status(502).json({ error: 'تعذر بث الفيديو من الرابط الخارجي.' });
+      }
+    }
+  });
+
   app.use('/api', (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     const message = err instanceof Error ? err.message : 'حدث خطأ في الخادم.';
     res.status(500).json({ error: message });

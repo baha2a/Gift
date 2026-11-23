@@ -1,94 +1,84 @@
 import { useCallback, useEffect, useState } from 'react';
 import CreatorStudio from './components/CreatorStudio';
 import SurpriseStage from './components/SurpriseStage';
+import { fetchActivePrimaryGift, fetchGiftById } from './services/giftStore';
 import type { GiftRecord } from './types/gift';
 
-type ViewMode = 'loading' | 'surprise' | 'studio' | 'not-found';
+type ViewMode = 'loading' | 'surprise' | 'studio' | 'empty-public' | 'not-found';
 
-function getInitialRouteState(): { requestedGiftId: string | null; wantsStudio: boolean } {
+function getRouteInfo(): { requestedGiftId: string | null; isStudioRoute: boolean } {
   const url = new URL(window.location.href);
-  const path = url.pathname;
+  const path = url.pathname.replace(/\/+$/, '') || '/';
   const queryGift = url.searchParams.get('gift');
   const queryStudio = url.searchParams.get('studio');
 
-  const wantsStudio = queryStudio === '1' || path === '/studio';
-  let requestedGiftId = queryGift;
+  const isStudioRoute =
+    queryStudio === '1' || path === '/studio' || path === '/upload' || path === '/manage';
 
+  let requestedGiftId = queryGift;
   if (!requestedGiftId && path.startsWith('/g/')) {
-    const slug = path.slice(3).replace(/\/+$/, '').trim();
+    const slug = path.slice(3).trim();
     if (slug) requestedGiftId = slug;
   }
 
-  return { requestedGiftId, wantsStudio };
+  return { requestedGiftId, isStudioRoute };
 }
 
 export default function App() {
   const [mode, setMode] = useState<ViewMode>('loading');
-  const [gifts, setGifts] = useState<GiftRecord[]>([]);
   const [activeGift, setActiveGift] = useState<GiftRecord | null>(null);
 
-  const loadState = useCallback(async (preferredGiftId?: string) => {
+  const loadRoute = useCallback(async () => {
+    const { requestedGiftId, isStudioRoute } = getRouteInfo();
+
+    // Strict separation: /studio is exclusively for uploading/managing videos
+    if (isStudioRoute) {
+      setMode('studio');
+      return;
+    }
+
+    setMode('loading');
     try {
-      const { requestedGiftId, wantsStudio } = getInitialRouteState();
-      const targetId = preferredGiftId ?? requestedGiftId;
-
-      const listRes = await fetch('/api/gifts');
-      const listData = (await listRes.json()) as {
-        gifts: GiftRecord[];
-        primaryGift: GiftRecord | null;
-      };
-      const allGifts = Array.isArray(listData.gifts) ? listData.gifts : [];
-      setGifts(allGifts);
-
-      if (allGifts.length === 0) {
-        setActiveGift(null);
-        setMode('studio');
-        return;
-      }
-
-      let chosen: GiftRecord | null = null;
-      if (targetId) {
-        chosen = allGifts.find((g) => g.id === targetId) ?? null;
-        if (!chosen && requestedGiftId && !wantsStudio) {
+      if (requestedGiftId) {
+        const gift = await fetchGiftById(requestedGiftId);
+        if (!gift) {
           setActiveGift(null);
           setMode('not-found');
           return;
         }
+        setActiveGift(gift);
+        setMode('surprise');
+        return;
       }
 
-      if (!chosen) {
-        chosen = listData.primaryGift ?? allGifts[0] ?? null;
+      const primary = await fetchActivePrimaryGift();
+      if (!primary) {
+        setActiveGift(null);
+        // Never expose upload/studio UI on the public homepage
+        setMode('empty-public');
+        return;
       }
 
-      setActiveGift(chosen);
-      setMode(wantsStudio ? 'studio' : 'surprise');
+      setActiveGift(primary);
+      setMode('surprise');
     } catch {
-      setMode('studio');
+      setMode('not-found');
     }
   }, []);
 
   useEffect(() => {
-    loadState();
+    loadRoute();
     const handlePopState = () => {
-      loadState();
+      loadRoute();
     };
     window.addEventListener('popstate', handlePopState);
     return () => window.removeEventListener('popstate', handlePopState);
-  }, [loadState]);
+  }, [loadRoute]);
 
   const handlePreviewGift = (gift: GiftRecord) => {
     setActiveGift(gift);
-    const url = new URL(window.location.href);
-    url.searchParams.delete('studio');
-    if (gift.isPrimary) {
-      url.searchParams.delete('gift');
-      if (url.pathname === '/studio' || url.pathname.startsWith('/g/')) {
-        url.pathname = '/';
-      }
-    } else {
-      url.searchParams.set('gift', gift.id);
-    }
-    window.history.pushState({}, '', url.toString());
+    const targetUrl = gift.isPrimary ? '/' : `/g/${gift.id}`;
+    window.history.pushState({}, '', targetUrl);
     setMode('surprise');
   };
 
@@ -100,40 +90,34 @@ export default function App() {
     );
   }
 
-  if (mode === 'not-found') {
+  if (mode === 'studio') {
+    return <CreatorStudio onPreviewGift={handlePreviewGift} />;
+  }
+
+  if (mode === 'empty-public') {
     return (
       <div className="min-h-screen bg-[#060608] text-[#F6F1E7] flex flex-col items-center justify-center px-6 text-center">
+        <p className="text-sm text-[#E5B869] mb-4">ياذات الثغر الجميل</p>
         <h1 className="font-display text-3xl sm:text-4xl font-bold mb-3">
-          لم يتم العثور على هذا الإهداء
+          مفاجأة قيد التجهيز
         </h1>
-        <p className="text-sm text-[#A69D8E] mb-8 max-w-md">
-          قد يكون الرابط غير مكتمل أو تم حذف الفيديو من المكتبة.
+        <p className="text-sm text-[#A69D8E] max-w-md">
+          لم يتم نشر العرض بعد، يرجى العودة لاحقاً.
         </p>
-        <button
-          type="button"
-          onClick={() => {
-            window.history.pushState({}, '', '/');
-            loadState();
-          }}
-          className="px-6 py-3 rounded-full bg-[#E5B869] text-[#09080A] text-sm font-semibold hover:bg-[#EFC77E] transition-colors cursor-pointer"
-        >
-          الانتقال للعرض الرئيسي
-        </button>
       </div>
     );
   }
 
-  if (mode === 'studio' || !activeGift) {
+  if (mode === 'not-found' || !activeGift) {
     return (
-      <CreatorStudio
-        gifts={gifts}
-        activeGift={activeGift}
-        onGiftsChanged={async (preferredId) => {
-          await loadState(preferredId);
-          setMode('studio');
-        }}
-        onPreviewGift={handlePreviewGift}
-      />
+      <div className="min-h-screen bg-[#060608] text-[#F6F1E7] flex flex-col items-center justify-center px-6 text-center">
+        <h1 className="font-display text-3xl sm:text-4xl font-bold mb-3">
+          لم يتم العثور على هذا العرض
+        </h1>
+        <p className="text-sm text-[#A69D8E] mb-8 max-w-md">
+          قد يكون الرابط غير مكتمل أو تم حذف الفيديو من قِبل صاحبه.
+        </p>
+      </div>
     );
   }
 
